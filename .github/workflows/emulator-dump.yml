@@ -1,12 +1,5 @@
 name: Emulator smoke test - 8 Ball Pool boot + libgame dump
 
-# Research rig for the 8 Ball Pool project: boot the STOCK 8 Ball Pool APK
-# on a GitHub Actions emulator and dump its encrypted native library
-# (libgame) from memory with Frida. The APK is downloaded at runtime from
-# APKPure and NEVER committed to this repo. The memory dump is uploaded as
-# a workflow artifact with 1-day retention and deleted after download.
-# Manual trigger only. Public repo = free unlimited standard minutes.
-
 on:
   workflow_dispatch:
 
@@ -15,6 +8,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
+      - name: Checkout repo (for smoke-test.sh)
+        uses: actions/checkout@v4
+
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -33,64 +29,11 @@ jobs:
           heap-size: 1024M
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
           emulator-boot-timeout: 600
-          script: |
-            set -x
-            mkdir -p dump logs
-            echo "=== Emulator info ==="
-            adb shell getprop ro.build.version.sdk
-            adb shell getprop ro.product.model
-            adb root
-            adb shell id
-
-            echo "=== Download 8 Ball Pool APK (APKPure, runtime only) ==="
-            # Primary: APKPure direct download domain. Fallback: APKPure page.
-            # Known-good version: 56.35.0 (versionCode 4077), 172,596,975 bytes,
-            # SHA256 cb7d591318c0b23b9d84caf766ee219b68bb68d3958aadf0e66e5e505303db34.
-            # If APKPure serves a newer version the hash differs; log it and continue.
-            curl -L --max-time 300 -o eightball.apk "https://d.apkpure.com/b/APK/com.miniclip.eightballpool?version=4077" || curl -L --max-time 300 -o eightball.apk "https://apkpure.com/8-ball-pool/com.miniclip.eightballpool/download"
-            ls -la eightball.apk
-            sha256sum eightball.apk | tee logs/apk-sha256.txt
-            file eightball.apk || true
-
-            echo "=== Install APK ==="
-            adb install -r -g eightball.apk 2>&1 | tee logs/install.log
-            adb shell pm list packages | grep eightball || true
-
-            echo "=== PHASE A: launch game, check it boots ==="
-            adb shell am start -n com.miniclip.eightballpool/com.miniclip.eightballpool.MainActivity || adb shell monkey -p com.miniclip.eightballpool -c android.intent.category.LAUNCHER 1
-            sleep 90
-            adb shell ps -A | grep -i eightball | tee logs/game-ps.txt || echo "GAME PROCESS NOT FOUND" | tee logs/game-ps.txt
-            adb shell screencap -p /sdcard/boot.png
-            adb pull /sdcard/boot.png logs/boot.png || true
-            GAME_PID=$(adb shell pidof com.miniclip.eightballpool | tr -d '\r' | head -1 || true)
-            echo "GAME_PID=$GAME_PID" | tee logs/game-pid.txt
-            if [ -n "$GAME_PID" ]; then
-              adb shell "cat /proc/$GAME_PID/maps" | grep -i libgame | tee logs/libgame-maps.txt || echo "libgame NOT in maps (yet)" | tee logs/libgame-maps.txt
-              adb shell "cat /proc/$GAME_PID/maps" | grep -i libloader | tee logs/libloader-maps.txt || true
-            else
-              echo "No game PID: the game did not stay alive under ARM translation." | tee logs/boot-failed.txt
-            fi
-
-            echo "=== PHASE B: Frida dump (only if game is alive + libgame mapped) ==="
-            if [ -n "$GAME_PID" ] && grep -qi libgame logs/libgame-maps.txt 2>/dev/null; then
-              FRIDA_VERSION="17.26.2"
-              git clone --depth 1 https://github.com/ByteSnipers/fridump-bs
-              python3 -m pip install -q -r fridump-bs/requirements.txt
-              python3 -m pip install -q "frida==${FRIDA_VERSION}"
-              curl -L --max-time 120 -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-x86_64.xz"
-              xz -d frida-server.xz
-              adb push frida-server /data/local/tmp/frida-server
-              adb shell chmod 755 /data/local/tmp/frida-server
-              adb shell /data/local/tmp/frida-server &
-              sleep 5
-              adb shell /data/local/tmp/frida-server --version || true
-              python3 fridump-bs/fridump-bs.py -U -v "$GAME_PID" -o dump/ 2>&1 | tee logs/frida-dump.log || echo "Frida dump step failed (see log)" | tee -a logs/frida-dump.log
-              ls -la dump/ || true
-            else
-              echo "Skipping Frida dump: game not alive or libgame not mapped." | tee logs/dump-skipped.txt
-            fi
-            echo "=== DONE ==="
-            ls -la logs/ dump/ || true
+          # Single command: the runner executes `script:` LINE BY LINE via
+          # `sh -c <line>`, which breaks multi-line if/then/fi blocks (run #1
+          # died on `if [ -n "$GAME_PID" ]; then`). All logic lives in
+          # smoke-test.sh, run here as one line.
+          script: bash smoke-test.sh
 
       - name: Upload results artifact
         if: always()
