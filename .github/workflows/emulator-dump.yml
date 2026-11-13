@@ -43,6 +43,10 @@ jobs:
             adb shell id
 
             echo "=== Download 8 Ball Pool APK (APKPure, runtime only) ==="
+            # Primary: APKPure direct download domain. Fallback: APKPure page.
+            # Known-good version: 56.35.0 (versionCode 4077), 172,596,975 bytes,
+            # SHA256 cb7d591318c0b23b9d84caf766ee219b68bb68d3958aadf0e66e5e505303db34.
+            # If APKPure serves a newer version the hash differs; log it and continue.
             curl -L --max-time 300 -o eightball.apk "https://d.apkpure.com/b/APK/com.miniclip.eightballpool?version=4077" || curl -L --max-time 300 -o eightball.apk "https://apkpure.com/8-ball-pool/com.miniclip.eightballpool/download"
             ls -la eightball.apk
             sha256sum eightball.apk | tee logs/apk-sha256.txt
