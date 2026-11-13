@@ -42,7 +42,19 @@ adb install -r -g eightball.apk 2>&1 | tee logs/install.log
 adb shell pm list packages | grep eightball || true
 
 echo "=== PHASE A: launch game, check it boots ==="
-adb shell am start -n com.miniclip.eightballpool/com.miniclip.eightballpool.MainActivity || adb shell monkey -p com.miniclip.eightballpool -c android.intent.category.LAUNCHER 1
+# Primary: explicit LAUNCHER activity from the manifest (EightBallPoolActivity,
+# exported). Run #2 used MainActivity, which does not exist — the game never
+# launched (install itself succeeded). NOTE: `adb shell am start` returns exit 0
+# even when the activity does not exist, so the old `|| monkey` fallback never
+# fired; launch success is checked with pidof below, not with the exit code.
+adb shell am start -n com.miniclip.eightballpool/com.miniclip.eightballpool.EightBallPoolActivity || true
+sleep 15
+GAME_PID=$(adb shell pidof com.miniclip.eightballpool | tr -d '\r' | head -1 || true)
+if [ -z "$GAME_PID" ]; then
+  echo "Explicit launch did not start a process; trying monkey (resolves LAUNCHER from manifest)." | tee logs/launch-retry.txt
+  adb shell monkey -p com.miniclip.eightballpool -c android.intent.category.LAUNCHER 1 || true
+  sleep 15
+fi
 sleep 90
 adb shell ps -A | grep -i eightball | tee logs/game-ps.txt || echo "GAME PROCESS NOT FOUND" | tee logs/game-ps.txt
 adb shell screencap -p /sdcard/boot.png
@@ -54,6 +66,7 @@ if [ -n "$GAME_PID" ]; then
   adb shell "cat /proc/$GAME_PID/maps" | grep -i libloader | tee logs/libloader-maps.txt || true
 else
   echo "No game PID: the game did not stay alive under ARM translation." | tee logs/boot-failed.txt
+  adb shell logcat -d 2>/dev/null | grep -iE "eightball|miniclip|AndroidRuntime|FATAL" | tail -80 | tee logs/logcat.txt || true
   echo "=== DONE (boot failed) ==="
   ls -la logs/ dump/ || true
   exit 1
