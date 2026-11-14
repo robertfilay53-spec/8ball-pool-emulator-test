@@ -1,0 +1,219 @@
+# Build the Android Emulator for Linux aarch64 FROM SOURCE on GitHub Actions.
+#
+# WHY THIS EXISTS: Google ships NO Linux aarch64 emulator binary in any
+# sdkmanager channel (verified in repository2-1.xml: 0 aarch64/arm64 refs;
+# the download archive lists only linux_x64 + darwin_aarch64). The only
+# remaining path to an arm64 Linux emulator binary is building it from
+# AOSP source. The documented flow (Android Emulator release notes,
+# 36.3.10 "Emulator for ARM64 hosts") is a CROSS build from an x86_64
+# host:
+#   repo init -u https://android.googlesource.com/platform/manifest \
+#       -b emu-master-dev --depth=1
+#   repo sync -qcj 12
+#   sudo apt-get install crossbuild-essential-arm64
+#   python android/build/python/cmake.py --noqtwebengine \
+#       --noshowprefixforinfo --target linux_aarch64
+#
+# HOW TO ADD: the VM's GitHub token has no `workflow` scope, so workflow
+# files cannot be pushed from the VM. Add this file via the GitHub web UI:
+# repo -> .github/workflows/build-emulator-arm64.yml -> paste -> Commit.
+# Repo: https://github.com/robertfilay53-spec/8ball-pool-emulator-test
+# Then trigger with: gh workflow run build-emulator-arm64.yml
+#   -f mode=size-check   (sync only, measure the real source size, no build)
+#   -f mode=full         (sync + build + upload the emulator tarball)
+#
+# FEASIBILITY (measured Nov 14, 2026 — see the parent's report):
+# - Manifest: emu-master-dev default.xml = 76 projects (measured directly).
+# - Source size: 2016 documented figure ~12 GB full sync; today, with the
+#   grown prebuilts (clang x3 hosts, Qt, mesa, system-images, webrtc),
+#   estimated 20-35 GB full, ~12-20 GB shallow (--depth=1). NOT measured
+#   exactly — the size-check mode exists to measure it for real.
+# - Runner disk: documented 14 GB SSD; a real standard-runner job measured
+#   ~43 GB free on a 96 GB disk (latchkey.dev, Sep 2026). The free-disk
+#   step below removes the preinstalled Android SDK / .NET / Haskell /
+#   Docker images, which typically frees another ~20-30 GB, so realistic
+#   usable disk after cleanup is ~50-70 GB. The sync fits ONLY with the
+#   cleanup + the shallow --depth=1 sync. The size gate below fails fast
+#   if the synced tree exceeds 25 GB.
+# - Build time: no direct measurement. QEMU + deps on 4 vCPU, with the
+#   aarch64 minbuild (no QtWebEngine, no WebRTC, no QEMU_UPSTREAM — set
+#   automatically for LINUX_AARCH64 in external/qemu/CMakeLists.txt),
+#   estimated 1.5-3 h build + 15-45 min sync = 2-4 h total, inside the
+#   6 h job limit, with NO retry slack. There is no cache that can hold
+#   the source tree (Actions cache cap is 10 GB/repo), so every failure
+#   is a full redo.
+# - Artifact quota: GitHub Free gives 500 MB total artifact storage
+#   (metered in GB-hours). The emulator zip is expected ~350-400 MB
+#   (linux_x64 is ~329 MB), so ONE upload nearly fills the quota.
+#   retention-days is 1; the parent must download it promptly and delete
+#   the artifact afterwards.
+# - RAM: 16 GB on the runner. The build uses the default parallelism;
+#   if the linker OOMs, lower it (cmake.py / ninja -j2).
+#
+# HONEST LIMITS — a successful build does NOT remove these:
+# (a) The built emulator still runs WITHOUT KVM on GitHub runners
+#     (TCG software emulation, extremely slow). It is only fast on a
+#     host WITH KVM, which no free GitHub runner provides.
+# (b) The 8 Ball Pool game may still self-exit on its own anti-emulator
+#     checks (Build fingerprint / ro.kernel.qemu / SIM). The build
+#     answers "can we get an arm64 emulator binary at all", not
+#     "will the game boot on it".
+# (c) The binary runs on aarch64 hosts ONLY (ubuntu-24.04-arm runner,
+#     or a real ARM machine). It cannot run on the x86_64 build host.
+#
+# FIRST RUN: mode=size-check. If the measured sync size is <= 25 GB,
+# run mode=full. If it exceeds 25 GB, the build does not fit on a
+# standard runner — stop and report the number (larger runners are
+# paid, and a self-hosted builder would be the next option).
+name: Build Android Emulator (linux_aarch64) from source
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "size-check = sync only, measure source size; full = sync + build + upload"
+        required: true
+        default: "size-check"
+        type: choice
+        options:
+          - size-check
+          - full
+
+jobs:
+  build-emulator-arm64:
+    # CROSS-BUILD HOST: Google's documented flow cross-compiles from
+    # x86_64 -> arm64 (cmake.py --target linux_aarch64 +
+    # crossbuild-essential-arm64). Building natively on the arm64 runner
+    # is undocumented for this target, and both runner types have the
+    # same 4 vCPU / 16 GB / 14 GB limits, so the x86_64 host is used.
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Disk + memory before cleanup
+        run: |
+          df -h
+          free -h
+          nproc
+
+      # Standard runners ship ~54 GB of preinstalled toolchains; removing
+      # the ones this build does not need is what makes the sync fit.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Disk after cleanup
+        run: df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y git build-essential python3 qemu-kvm \
+            ninja-build ccache cmake crossbuild-essential-arm64
+          mkdir -p "$HOME/bin"
+          curl -s https://commondatastorage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
+          chmod 700 "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          repo --version || true
+          python3 --version
+          cmake --version | head -1
+
+      - name: Repo init (emu-master-dev, shallow)
+        run: |
+          mkdir -p "$HOME/emu-master-dev" && cd "$HOME/emu-master-dev"
+          repo init -u https://android.googlesource.com/platform/manifest \
+            -b emu-master-dev --depth=1
+
+      - name: Repo sync
+        run: |
+          cd "$HOME/emu-master-dev"
+          repo sync -qcj 12
+          echo "--- sync done, disk now:"
+          df -h
+
+      - name: Size checkpoint (fail fast if the tree does not fit)
+        id: size-check
+        run: |
+          cd "$HOME/emu-master-dev"
+          echo "=== total source tree size:"
+          du -sh . | tee "$GITHUB_WORKSPACE/source-size.txt"
+          echo "=== largest top-level dirs:"
+          du -sh ./* 2>/dev/null | sort -rh | head -15 | tee -a "$GITHUB_WORKSPACE/source-size.txt"
+          echo "=== .repo size (git metadata):"
+          du -sh .repo | tee -a "$GITHUB_WORKSPACE/source-size.txt"
+          SIZE_GB=$(du -sb . | awk '{printf "%.1f", $1/1073741824}')
+          echo "size_gb=$SIZE_GB" >> "$GITHUB_OUTPUT"
+          echo "Synced tree: ${SIZE_GB} GB"
+          if awk "BEGIN {exit !($SIZE_GB > 25)}"; then
+            echo "::error::Source tree is ${SIZE_GB} GB, over the 25 GB gate — the build does not fit on a standard runner. Stopping here."
+            exit 1
+          fi
+
+      - name: Upload size report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-source-size
+          path: source-size.txt
+          retention-days: 7
+
+      # size-check mode ends here: the parent reads the real size from
+      # the artifact and decides whether to run mode=full.
+      - name: Stop here in size-check mode
+        if: inputs.mode == 'size-check'
+        run: |
+          echo "Size-check complete: ${{ steps.size-check.outputs.size_gb }} GB synced."
+          echo "If <= 25 GB, re-run with mode=full to build."
+
+      - name: Build emulator (linux_aarch64)
+        if: inputs.mode == 'full'
+        run: |
+          cd "$HOME/emu-master-dev"
+          python android/build/python/cmake.py \
+            --noqtwebengine --noshowprefixforinfo \
+            --target linux_aarch64
+          echo "--- build done, disk now:"
+          df -h
+          echo "--- emulator binaries found:"
+          cd external/qemu
+          find objs -maxdepth 2 -name "emulator*" -o -maxdepth 2 -name "qemu-system-aarch64" 2>/dev/null | head -20
+
+      - name: Package emulator binary
+        if: inputs.mode == 'full'
+        run: |
+          cd "$HOME/emu-master-dev/external/qemu"
+          # The cmake build puts the emulator under objs/. Package the
+          # binary plus its libraries into one tarball. (The old
+          # android/scripts/package-release.sh no longer exists on
+          # emu-master-dev, so packaging is done here.)
+          if [ -f objs/emulator ]; then EMU_BIN=objs/emulator; else EMU_BIN=$(find objs -maxdepth 2 -name "emulator" -type f | head -1); fi
+          echo "Emulator binary: $EMU_BIN"
+          ls -la "$EMU_BIN"
+          tar czf "$GITHUB_WORKSPACE/emulator-linux_aarch64.tar.gz" \
+            -C objs emulator lib64 2>/dev/null || \
+          tar czf "$GITHUB_WORKSPACE/emulator-linux_aarch64.tar.gz" \
+            -C "$(dirname "$EMU_BIN")" "$(basename "$EMU_BIN")"
+          ls -lh "$GITHUB_WORKSPACE/emulator-linux_aarch64.tar.gz"
+          sha256sum "$GITHUB_WORKSPACE/emulator-linux_aarch64.tar.gz" | tee "$GITHUB_WORKSPACE/emulator-linux_aarch64.sha256"
+          SIZE_MB=$(stat -c%s "$GITHUB_WORKSPACE/emulator-linux_aarch64.tar.gz" | awk '{printf "%.0f", $1/1048576}')
+          echo "Tarball: ${SIZE_MB} MB"
+          if [ "$SIZE_MB" -gt 500 ]; then
+            echo "::warning::Tarball is ${SIZE_MB} MB — over the 500 MB Free-plan artifact quota. The upload below may fail; split the tarball or use another host."
+          fi
+
+      - name: Upload emulator artifact
+        if: inputs.mode == 'full'
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-linux_aarch64
+          path: |
+            emulator-linux_aarch64.tar.gz
+            emulator-linux_aarch64.sha256
+          retention-days: 1
+          if-no-files-found: error
