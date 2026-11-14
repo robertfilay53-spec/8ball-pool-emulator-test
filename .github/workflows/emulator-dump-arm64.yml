@@ -1,0 +1,71 @@
+name: Emulator smoke test ARM64 - 8 Ball Pool boot + libgame dump
+
+on:
+  workflow_dispatch:
+
+jobs:
+  emulator-dump-arm64:
+    # ARM64 runner: free + unlimited on public repos (GitHub docs:
+    # "Use of the standard GitHub-hosted runners is free and unlimited
+    # on public repositories"). 4 vCPU / 16 GB, Cobalt 100 (Neoverse N2).
+    # The game is arm64-only, so this is the first run with NO ARM
+    # translation. If the game still dies ~4s after launch, the cause is
+    # the game's own anti-emulator checks, not translation.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repo (for smoke-test-arm64.sh)
+        uses: actions/checkout@v4
+
+      # KVM PROBE (non-fatal): answers whether this runner exposes
+      # /dev/kvm. Cloud ARM VMs generally do NOT expose nested
+      # virtualization, so the emulator will most likely run with
+      # -accel off (software emulation, slow boot) — the probe records
+      # the fact in the log instead of guessing. The udev step below is
+      # harmless when /dev/kvm does not exist.
+      - name: Probe KVM + host arch
+        run: |
+          uname -m
+          if [ -e /dev/kvm ]; then echo "KVM_PRESENT"; ls -l /dev/kvm; else echo "KVM_ABSENT (emulator will run unaccelerated)"; fi
+          ls /dev/kvm 2>/dev/null || true
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run emulator + smoke test
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          # google_apis (userdebug) — adb root works, which the Frida
+          # dump needs. google_apis_playstore is a user build (no adb
+          # root). system-images;android-34;google_apis;arm64-v8a exists
+          # in Google's repository (verified in the google_apis
+          # sys-img2-1.xml index, 2026-11-14).
+          target: google_apis
+          arch: arm64-v8a
+          profile: pixel_7_pro
+          cores: 4
+          ram-size: 6144M
+          heap-size: 1024M
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          # Software-emulated ARM boots slowly; 1800s cap (was 600 on x86).
+          emulator-boot-timeout: 1800
+          # Single command: the runner executes `script:` LINE BY LINE via
+          # `sh -c <line>`, which breaks multi-line if/then/fi blocks (run #1
+          # died on `if [ -n "$GAME_PID" ]; then`). All logic lives in
+          # smoke-test-arm64.sh, run here as one line.
+          script: bash smoke-test-arm64.sh
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-smoke-test-results-arm64
+          path: |
+            logs/
+            dump/
+          retention-days: 1
+          if-no-files-found: warn
